@@ -1,0 +1,36 @@
+version: "3.8"
+services:
+  go-pkcs11-app:
+    image: go-pkcs11-latest:1.0
+    container_name: go-pkcs11-app
+    volumes:
+      - ./go-pkcs11:/go-pkcs11
+      - ./config/:/opt/procrypt/km3000/config/
+      - ./HSM_lib/libprocryptoki.so:/lib/libprocryptoki.so
+      - ./HSM_lib/libprocryptoki.so:/lib64/libprocryptoki.so
+    environment:
+      - PKCS11_LIB=/lib64/libprocryptoki.so
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    #command: ["go", "run", "main.go"]
+    command: ["sleep", "infinity"]
+    networks:
+      pkcs11_network:
+        ipv4_address: 172.28.0.2
+
+  go-pkcs11-hsm:
+    image: hsm
+    container_name: hsm
+    ports:
+      - "5000:5000"
+    networks:
+      pkcs11_network:
+        ipv4_address: 172.28.0.3
+
+networks:
+  pkcs11_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

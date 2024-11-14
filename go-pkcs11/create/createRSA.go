@@ -7,32 +7,35 @@ import (
 	"github.com/miekg/pkcs11"
 )
 
-// GenerateRSAKey generates an RSA key on the HSM
+// GenerateRSAKey generates an RSA key pair on the HSM
 func GenerateRSAKey(slotID int, userPin string, keySize int, keyLabel string) (string, error) {
+	// Get the PKCS#11 library path from the environment
 	libraryPath := os.Getenv("PKCS11_LIB")
 	if libraryPath == "" {
 		return "", fmt.Errorf("PKCS11_LIB environment variable is not set")
 	}
 
+	// Initialize PKCS#11 library
 	p := pkcs11.New(libraryPath)
 	if err := p.Initialize(); err != nil {
 		return "", fmt.Errorf("failed to initialize PKCS#11 library: %v", err)
 	}
 	defer p.Finalize()
 
-	// Belirtilen slot numarası ile oturumu başlatıyoruz
+	// Open a session for the given slot ID
 	session, err := p.OpenSession(uint(slotID), pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
 	if err != nil {
 		return "", fmt.Errorf("failed to open session: %v", err)
 	}
 	defer p.CloseSession(session)
 
-	// Belirtilen PIN ile oturumu açıyoruz
+	// Log in to the session using the user PIN
 	if err := p.Login(session, pkcs11.CKU_USER, userPin); err != nil {
 		return "", fmt.Errorf("failed to log in: %v", err)
 	}
 	defer p.Logout(session)
 
+	// Define key attributes
 	modulusBits := keySize
 	keyID := []byte{1, 2, 3, 4}
 
@@ -59,6 +62,7 @@ func GenerateRSAKey(slotID int, userPin string, keySize int, keyLabel string) (s
 		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
 	}
 
+	// Generate the RSA key pair
 	pubKeyHandle, privKeyHandle, err := p.GenerateKeyPair(
 		session,
 		[]*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS_KEY_PAIR_GEN, nil)},
@@ -69,5 +73,7 @@ func GenerateRSAKey(slotID int, userPin string, keySize int, keyLabel string) (s
 		return "", fmt.Errorf("failed to generate RSA key pair: %v", err)
 	}
 
-	return fmt.Sprintf("RSA key pair generated on HSM with labels:\nPublic Key Label: %s\nPrivate Key Label: %s\nPublic Key Handle: %v\nPrivate Key Handle: %v", keyLabel+"_pub", keyLabel+"_priv", pubKeyHandle, privKeyHandle), nil
+	// Return information about the generated keys
+	return fmt.Sprintf("RSA key pair generated on HSM:\nPublic Key Label: %s\nPrivate Key Label: %s\nPublic Key Handle: %v\nPrivate Key Handle: %v",
+		keyLabel+"_pub", keyLabel+"_priv", pubKeyHandle, privKeyHandle), nil
 }

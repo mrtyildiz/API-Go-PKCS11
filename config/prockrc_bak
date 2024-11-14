@@ -1,0 +1,40 @@
+
+[general]
+#disable_mutex = false
+
+#[debug]
+#log_severity = 6
+
+[log]
+# Log level.
+# Possible values: none, fatal, error, warning, info, debug, verbose
+# Default: error
+level = verbose
+
+# Write logs to console.
+# Possible values: true, false
+# Default: true
+console = false
+
+# Path to log file. A relative or absolute path can be specified. If empty,
+# no log file is used.
+# Default: (empty)
+file = /opt/log
+
+# Log file format.
+# Possible values: txt, csv
+# Default: txt
+file_format = csv
+
+# Maximum size for log file. Accepts the usual "K", "M", "G" and "T" suffixes
+# (to the base of 1024). If set to 0, rotation is disabled.
+# Default: 0
+max_file_size = 5M
+
+# Maximum number of files to keep. If set to 0, rotation is disabled.
+# Default: 0
+max_files = 4
+[ha]
+load_balance = true
+[slot.0]
+user_pin = 1111

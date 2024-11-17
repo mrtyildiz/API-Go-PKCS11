@@ -3,7 +3,7 @@ package encrypt
 import (
 	"bytes"
 	"fmt"
-
+	"encoding/hex"
 	"github.com/miekg/pkcs11"
 )
 
@@ -108,3 +108,63 @@ func DecryptData(p *pkcs11.Ctx, session pkcs11.SessionHandle, aesKey pkcs11.Obje
 
 	return plaintext, nil
 }
+
+// EncryptCBC encrypts plaintext using AES in CBC mode with a user-provided IV.
+func EncryptCBC(p *pkcs11.Ctx, session pkcs11.SessionHandle, aesKey pkcs11.ObjectHandle, plaintext []byte, ivHex string) ([]byte, error) {
+	// Pad plaintext to be a multiple of AES block size (16 bytes)
+	plaintext = Pad(plaintext, 16)
+
+	// Decode the provided IV from hexadecimal string
+	iv, err := hex.DecodeString(ivHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid IV format: %v", err)
+	}
+	if len(iv) != 16 {
+		return nil, fmt.Errorf("IV must be 16 bytes long")
+	}
+
+	// Initialize encryption with CBC mode
+	err = p.EncryptInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_CBC_PAD, iv)}, aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize encryption: %v", err)
+	}
+
+	ciphertext, err := p.Encrypt(session, plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt data: %v", err)
+	}
+
+	return ciphertext, nil
+}
+
+// DecryptCBC decrypts ciphertext using AES in CBC mode with a user-provided IV.
+func DecryptCBC(p *pkcs11.Ctx, session pkcs11.SessionHandle, aesKey pkcs11.ObjectHandle, ciphertext []byte, ivHex string) ([]byte, error) {
+	// Decode the provided IV from hexadecimal string
+	iv, err := hex.DecodeString(ivHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid IV format: %v", err)
+	}
+	if len(iv) != 16 {
+		return nil, fmt.Errorf("IV must be 16 bytes long")
+	}
+
+	// Initialize decryption with the same IV used for encryption
+	err = p.DecryptInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_CBC_PAD, iv)}, aesKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize decryption: %v", err)
+	}
+
+	plaintext, err := p.Decrypt(session, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt data: %v", err)
+	}
+
+	// Remove padding after decryption
+	plaintext, err = Unpad(plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpad data: %v", err)
+	}
+
+	return plaintext, nil
+}
+

@@ -10,6 +10,7 @@ import (
 	"go-pkcs11/encrypt"
 	"os"
 	"log"
+	"go-pkcs11/remove"
 )
 
 type AES_Create struct {
@@ -63,6 +64,12 @@ type DecryptRequest_CBC struct {
 	KeyLabel   string `json:"key_label" binding:"required"`   // AES Anahtar Etiketi
 	CipherText string `json:"cipher_text" binding:"required"` // Şifrelenmiş Metin (hexadecimal)
 	IV         string `json:"iv" binding:"required"`          // Kullanıcı tarafından sağlanan IV (hexadecimal)
+}
+
+type aliasRequest struct {
+	Slot		uint	`json:"slot_id"`
+	Pin			string	`json:"slot_pin" binding:"required"`
+	KeyLabel	string	`json:"key_label" binding:"required"`
 }
 
 
@@ -280,6 +287,7 @@ func main() {
 
 	// AES-CBC Çözme Endpoint
 	router.POST("/decrypt/aesCBCDecrypt", func(c *gin.Context) {
+
 		var req DecryptRequest_CBC
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -329,5 +337,41 @@ func main() {
 		// Orijinal Metni Döndür
 		c.JSON(http.StatusOK, gin.H{"plain_text": string(plaintext)})
 	})
+	router.POST("/remove/obje", func(c *gin.Context) {
+		var req aliasRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	
+		// PKCS#11 Kütüphane Yolunu Al
+		libraryPath := os.Getenv("PKCS11_LIB")
+		if libraryPath == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "PKCS11_LIB environment variable is not set"})
+			return
+		}
+	
+		// HSM ve Oturum Başlat
+		p, session, err := encrypt.InitializePKCS11(libraryPath, req.Pin, req.Slot)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		defer func() {
+			p.Logout(session)
+			p.CloseSession(session)
+			p.Finalize()
+		}()
+	
+		// DeleteKeyByAlias için doğrudan req.KeyLabel kullanılıyor
+		err = remove.DeleteKeyByAlias(p, session, req.KeyLabel)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	
+		c.JSON(http.StatusOK, gin.H{"message": "Key deleted successfully"})
+	})
+	
     router.Run(":8080")
 }

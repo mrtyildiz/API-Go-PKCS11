@@ -1,6 +1,9 @@
 package encrypt
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"math/big"
 	"bytes"
 	"fmt"
 	"encoding/hex"
@@ -167,4 +170,75 @@ func DecryptCBC(p *pkcs11.Ctx, session pkcs11.SessionHandle, aesKey pkcs11.Objec
 
 	return plaintext, nil
 }
+
+// FindRSAKey finds an RSA private key on HSM and retrieves its public counterpart
+func FindRSAKey(p *pkcs11.Ctx, session pkcs11.SessionHandle, label string) (pkcs11.ObjectHandle, *rsa.PublicKey, error) {
+	err := p.FindObjectsInit(session, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, label),
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
+		pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, pkcs11.CKK_RSA),
+	})
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to initialize search for key: %v", err)
+	}
+
+	handles, _, err := p.FindObjects(session, 1)
+	if err != nil {
+		p.FindObjectsFinal(session)
+		return 0, nil, fmt.Errorf("failed to find objects: %v", err)
+	}
+
+	err = p.FindObjectsFinal(session)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to finalize object search: %v", err)
+	}
+
+	if len(handles) == 0 {
+		return 0, nil, fmt.Errorf("no RSA key found with label: %s", label)
+	}
+
+	attributes := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_MODULUS, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, nil),
+	}
+	attributes, err = p.GetAttributeValue(session, handles[0], attributes)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to get public key attributes: %v", err)
+	}
+
+	modulus := new(big.Int).SetBytes(attributes[0].Value)
+	exponent := new(big.Int).SetBytes(attributes[1].Value).Int64()
+
+	pubKey := &rsa.PublicKey{
+		N: modulus,
+		E: int(exponent),
+	}
+
+	return handles[0], pubKey, nil
+}
+
+// EncryptDataRSA encrypts data using RSA public key
+func EncryptDataRSA(pubKey *rsa.PublicKey, plaintext []byte) ([]byte, error) {
+	ciphertext, err := rsa.EncryptPKCS1v15(rand.Reader, pubKey, plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt data: %v", err)
+	}
+	return ciphertext, nil
+}
+
+// DecryptDataRSA decrypts data using RSA private key on HSM
+func DecryptDataRSA(p *pkcs11.Ctx, session pkcs11.SessionHandle, privKeyHandle pkcs11.ObjectHandle, ciphertext []byte) ([]byte, error) {
+	err := p.DecryptInit(session, []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS, nil)}, privKeyHandle)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize decryption: %v", err)
+	}
+
+	plaintext, err := p.Decrypt(session, ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt data: %v", err)
+	}
+
+	return plaintext, nil
+}
+
 

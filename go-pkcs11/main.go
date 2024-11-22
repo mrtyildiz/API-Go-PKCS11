@@ -2,19 +2,25 @@
 package main
 
 import (
-    "github.com/gin-gonic/gin"
+	"encoding/base64"
 	"encoding/hex"
-    "fmt"
-	"net/http"
-	"strings"
-    "go-pkcs11/create"
-	"go-pkcs11/encrypt"
-	"os"
-	"log"
-	"path/filepath"
-	"go-pkcs11/remove"
+	"crypto/ecdsa"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"io/ioutil"
 	"go-pkcs11/certificate"
+	"go-pkcs11/create"
+	"go-pkcs11/encrypt"
+	"go-pkcs11/remove"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"github.com/gin-gonic/gin"
+	"github.com/miekg/pkcs11"
 )
 
 type AES_Create struct {
@@ -76,6 +82,12 @@ type aliasRequest struct {
 	KeyLabel	string	`json:"key_label" binding:"required"`
 }
 
+type DESCreate struct {
+	Slot     uint   `json:"slot"`
+	Pin      string `json:"pin"`
+	KeyLabel string `json:"keyLabel"`
+	KeyID    []byte `json:"keyID"`
+}
 
 
 func main() {
@@ -130,6 +142,7 @@ func main() {
 
 		c.JSON(http.StatusOK, gin.H{"message": result})
 	})
+	
 	router.POST("/create/ecCreate", func(c *gin.Context) {
 		var req KeyECRequest
 
@@ -476,9 +489,342 @@ func main() {
 		})
 	})
 
+	router.POST("/create/desCreate", func(c *gin.Context) {
+		var req DESCreate
+
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
+			return
+		}
+
+		libraryPath := os.Getenv("PKCS11_LIB")
+		if libraryPath == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "PKCS11_LIB environment variable is not set"})
+			return
+		}
+
+		manager, err := create.NewHSMManager(libraryPath, req.Slot)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize HSM manager"})
+			return
+		}
+		defer manager.Finalize()
+
+		if err := manager.Login(req.Pin); err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to log in to HSM"})
+			return
+		}
+		defer manager.Logout()
+
+		keyHandle, err := manager.GenerateDES3Key(req.KeyLabel, req.KeyID)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate DES3 key"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":    "DES3 key generated successfully",
+			"keyLabel":   req.KeyLabel,
+			"keyHandle":  keyHandle,
+			"keyID":      req.KeyID,
+		})
+	})
+
+
+
+	router.POST("/import/EC-keys", func(c *gin.Context) {
+		// Parse form data
+		slotIDStr := c.PostForm("slotID")
+		slotPIN := c.PostForm("slotPIN")
+		keyLabel := c.PostForm("keyLabel")
+
+		// Parse SlotID
+		slotID, err := strconv.Atoi(slotIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid SlotID"})
+			return
+		}
+
+		// Handle uploaded private key file
+		privateFile, err := c.FormFile("privateKey")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Private key file is required"})
+			return
+		}
+
+		// Save uploaded private key file temporarily
+		privateKeyPath := "./tmp_" + privateFile.Filename
+		if err := c.SaveUploadedFile(privateFile, privateKeyPath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save private key file"})
+			return
+		}
+		defer os.Remove(privateKeyPath)
+
+		// Handle uploaded public key file
+		publicFile, err := c.FormFile("publicKey")
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Public key file is required"})
+			return
+		}
+
+		// Save uploaded public key file temporarily
+		publicKeyPath := "./tmp_" + publicFile.Filename
+		if err := c.SaveUploadedFile(publicFile, publicKeyPath); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save public key file"})
+			return
+		}
+		defer os.Remove(publicKeyPath)
+
+		// Load keys from the uploaded files
+		privateKey, err := loadECPrivateKeyFromFile(privateKeyPath)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load private key"})
+			return
+		}
+
+		publicKey, err := loadECPublicKeyFromFile(publicKeyPath)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load public key"})
+			return
+		}
+
+		// Initialize PKCS#11 module
+		libraryPath := os.Getenv("PKCS11_LIB")
+		if libraryPath == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "PKCS11_LIB environment variable is not set"})
+			return
+		}
+
+		p := pkcs11.New(libraryPath)
+		if err := p.Initialize(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize PKCS#11 library"})
+			return
+		}
+		defer p.Finalize()
+
+		// Open session
+		session, err := p.OpenSession(uint(slotID), pkcs11.CKF_SERIAL_SESSION|pkcs11.CKF_RW_SESSION)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open session"})
+			return
+		}
+		defer p.CloseSession(session)
+
+		// Log in
+		if err := p.Login(session, pkcs11.CKU_USER, slotPIN); err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to log in"})
+			return
+		}
+		defer p.Logout(session)
+
+		// Define EC curve parameters
+		oidNamedCurveP256 := []byte{0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07}
+
+		// Import private key
+		privateKeyTemplate := []*pkcs11.Attribute{
+			pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
+			pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, pkcs11.CKK_EC),
+			pkcs11.NewAttribute(pkcs11.CKA_LABEL, keyLabel),
+			pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, true),
+			pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true),
+			pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
+			pkcs11.NewAttribute(pkcs11.CKA_EC_PARAMS, oidNamedCurveP256),
+			pkcs11.NewAttribute(pkcs11.CKA_VALUE, privateKey.D.Bytes()),
+		}
+		privHandle, err := p.CreateObject(session, privateKeyTemplate)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to import private key"})
+			return
+		}
+
+		// Import public key
+		publicKeyTemplate := []*pkcs11.Attribute{
+			pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
+			pkcs11.NewAttribute(pkcs11.CKA_KEY_TYPE, pkcs11.CKK_EC),
+			pkcs11.NewAttribute(pkcs11.CKA_LABEL, keyLabel),
+			pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
+			pkcs11.NewAttribute(pkcs11.CKA_EC_PARAMS, oidNamedCurveP256),
+			pkcs11.NewAttribute(pkcs11.CKA_EC_POINT, marshalECPublicKey(publicKey)),
+		}
+		pubHandle, err := p.CreateObject(session, publicKeyTemplate)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to import public key"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":         "Keys imported successfully",
+			"privateKeyHandle": privHandle,
+			"publicKeyHandle":  pubHandle,
+		})
+	})
+
+		// Endpoint to encrypt data
+	router.POST("/encrypt/rsaEncrypt", func(c *gin.Context) {
+		var req struct {
+			Slot     uint   `json:"slot"`
+			Pin      string `json:"pin"`
+			Label    string `json:"label"`
+			Plaintext string `json:"plaintext"`
+		}
+
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
+			return
+		}
+
+		libraryPath := os.Getenv("PKCS11_LIB")
+		if libraryPath == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "PKCS11_LIB environment variable is not set"})
+			return
+		}
+
+		// Initialize PKCS#11
+		p, session, err := encrypt.InitializePKCS11(libraryPath, req.Pin, req.Slot)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize PKCS#11"})
+			return
+		}
+		defer p.Finalize()
+		defer p.CloseSession(session)
+		defer p.Logout(session)
+
+		// Find RSA key
+		privKeyHandle, pubKey, err := encrypt.FindRSAKey(p, session, req.Label)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find RSA key"})
+			return
+		}
+		fmt.Println(privKeyHandle)
+
+		// Encrypt data
+		ciphertext, err := encrypt.EncryptDataRSA(pubKey, []byte(req.Plaintext))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encrypt data"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"ciphertext": ciphertext,
+		})
+	})
+
+	router.POST("/decrypt/rsaDecrypt", func(c *gin.Context) {
+		var req struct {
+			Slot       uint   `json:"slot"`
+			Pin        string `json:"pin"`
+			Label      string `json:"label"`
+			Ciphertext string `json:"ciphertext"` // Base64 formatında string alıyoruz
+		}
+	
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload"})
+			return
+		}
+	
+		libraryPath := os.Getenv("PKCS11_LIB")
+		if libraryPath == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "PKCS11_LIB environment variable is not set"})
+			return
+		}
+	
+		// Initialize PKCS#11
+		p, session, err := encrypt.InitializePKCS11(libraryPath, req.Pin, req.Slot)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize PKCS#11"})
+			return
+		}
+		defer p.Finalize()
+		defer p.CloseSession(session)
+		defer p.Logout(session)
+	
+		// Find RSA key
+		privKeyHandle, _, err := encrypt.FindRSAKey(p, session, req.Label)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find RSA key"})
+			return
+		}
+	
+		// Decode the Base64 ciphertext to []byte
+		ciphertextBytes, err := base64.StdEncoding.DecodeString(req.Ciphertext)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid Base64 encoded ciphertext"})
+			return
+		}
+	
+		// Decrypt data
+		plaintext, err := encrypt.DecryptDataRSA(p, session, privKeyHandle, ciphertextBytes)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decrypt data"})
+			return
+		}
+	
+		c.JSON(http.StatusOK, gin.H{
+			"plaintext": string(plaintext),
+		})
+	})
 
     router.Run(":8080")
 }
+// EC import işlemi için Start
+
+// Function to load a PEM file and decode the EC private key
+func loadECPrivateKeyFromFile(filepath string) (*ecdsa.PrivateKey, error) {
+	data, err := ioutil.ReadFile(filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "EC PRIVATE KEY" {
+		return nil, fmt.Errorf("failed to decode PEM block containing private key")
+	}
+
+	privateKey, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	return privateKey, nil
+}
+
+// Function to load a PEM file and decode the EC public key
+func loadECPublicKeyFromFile(filepath string) (*ecdsa.PublicKey, error) {
+	data, err := ioutil.ReadFile(filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "PUBLIC KEY" {
+		return nil, fmt.Errorf("failed to decode PEM block containing public key")
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	publicKey, ok := pub.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("not an EC public key")
+	}
+	return publicKey, nil
+}
+
+// Helper function to marshal the EC public key point to ASN.1 format for PKCS#11
+func marshalECPublicKey(pub *ecdsa.PublicKey) []byte {
+	x, y := pub.X.Bytes(), pub.Y.Bytes()
+
+	// ASN.1 OCTET STRING format
+	ecPoint := make([]byte, 1+len(x)+len(y))
+	ecPoint[0] = 0x04 // Uncompressed point indicator
+	copy(ecPoint[1:1+len(x)], x)
+	copy(ecPoint[1+len(x):], y)
+
+	return ecPoint
+}
+
+// EC import işlemi için Stop
+
 // createUploadsDirectory ensures the upload directory exists
 func createUploadsDirectory(path string) error {
 	return os.MkdirAll(path, os.ModePerm)
